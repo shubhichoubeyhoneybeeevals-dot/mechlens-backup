@@ -41,13 +41,26 @@ class RMSNorm(nn.Module):
         self.hook_scale = HookPoint()  # [batch, pos, 1]
         self.hook_normalized = HookPoint()  # [batch, pos, length]
 
+    def _hooked_scale(self, x_fp32: torch.Tensor) -> torch.Tensor:
+        """Fire hook_scale in cfg.dtype; return the fp32 scale used for the division.
+
+        Fixes #1108: hooks must observe the dtype the model consumes. If no hook edits the
+        scale (identity check) the fp32 value keeps feeding the division so the unhooked
+        forward is bit-identical to the pre-fix numerics; a returned tensor is honored.
+        """
+        scale_fp32 = (x_fp32.pow(2).mean(-1, keepdim=True) + self.eps).sqrt()
+        scale_model = scale_fp32.to(self.cfg.dtype)
+        hooked = self.hook_scale(scale_model)
+        if hooked is scale_model:
+            return scale_fp32
+        return hooked.to(scale_fp32.dtype)
+
     def forward(self, x: RMSNormInput) -> RMSNormInput:
         if self.cfg.dtype not in [torch.float32, torch.float64]:
             x = x.to(torch.float32)
-        scale: Float[torch.Tensor, "batch pos 1"] = self.hook_scale(
-            (x.pow(2).mean(-1, keepdim=True) + self.eps).sqrt()
-        )
-        x = self.hook_normalized(x / scale).to(self.cfg.dtype)  # [batch, pos, length]
+        scale = self._hooked_scale(x)  # hook_scale fires in cfg.dtype (#1108)
+        # Cast BEFORE the hook so hook_normalized observes what the model consumes (#1108).
+        x = self.hook_normalized((x / scale).to(self.cfg.dtype))  # [batch, pos, length]
 
         if x.device != self.w.device:
             self.to(x.device)
