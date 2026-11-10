@@ -84,7 +84,7 @@ def benchmark_run_with_cache(
             )
 
         # Verify cached tensors are actually tensors
-        non_tensor_keys = []
+        non_tensor_keys: list[str] = []
         for key, value in cache.items():
             if not isinstance(value, torch.Tensor):
                 non_tensor_keys.append(key)
