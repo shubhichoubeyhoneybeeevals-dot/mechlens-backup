@@ -27,7 +27,6 @@
     description="An implementation of transformers tailored for mechanistic interpretability."
     license={text="MIT"}
     name="transformer-lens"
-    packages=[{include="transformer_lens"}, {include="transformer_lens/py.typed"}]
     readme="README.md"
     requires-python=">=3.10,<4.0"
     version="0.0.0"
@@ -210,3 +209,6 @@
     strictListInference=true
     strictParameterNoneValue=true
     strictSetInference=true
+
+[tool.hatch.build.targets.wheel]
+    packages=["transformer_lens"]

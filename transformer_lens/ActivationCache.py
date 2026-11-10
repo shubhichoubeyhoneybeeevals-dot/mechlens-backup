@@ -14,15 +14,20 @@ back to these docs depending on what you need to do.
 from __future__ import annotations
 
 import logging
+import warnings
+from itertools import islice
 from typing import (
     TYPE_CHECKING,
     Any,
     Dict,
+    ItemsView,
     Iterator,
+    KeysView,
     List,
     Optional,
     Tuple,
     Union,
+    ValuesView,
     cast,
 )
 
@@ -37,6 +42,14 @@ from transformer_lens.utilities import Slice, SliceInput, warn_if_mps
 
 if TYPE_CHECKING:
     from transformer_lens.HookedTransformer import HookedTransformer
+
+
+CacheKey = Union[
+    str,
+    Tuple[str],
+    Tuple[str, Optional[int]],
+    Tuple[str, Optional[int], Optional[str]],
+]
 
 
 def _normalize_projection_to_2d(
@@ -134,6 +147,10 @@ class ActivationCache:
             The model that the activations are from.
         has_batch_dim:
             Whether the activations have a batch dimension.
+        device:
+            Explicitly move cached tensors to this device without moving the model.
+            None preserves tensor placement and warns about implicit inference from
+            the first cached tensor (CPU for an empty cache).
     """
 
     def __init__(
@@ -141,7 +158,9 @@ class ActivationCache:
         cache_dict: Dict[str, torch.Tensor],
         model: Any,
         has_batch_dim: bool = True,
-    ):
+        *,
+        device: Optional[Union[str, torch.device]] = None,
+    ) -> None:
         self.cache_dict = cache_dict
         # Helper methods require HT-internal structure; bridge users only use cache_dict.
         self.model = cast("HookedTransformer", model)
@@ -149,7 +168,30 @@ class ActivationCache:
         self.has_embed = "hook_embed" in self.cache_dict
         self.has_pos_embed = "hook_pos_embed" in self.cache_dict
 
+        self._empty_cache_device = torch.device("cpu")
+        target_device = self._resolve_device(device)
+        if device is not None:
+            self.to(target_device)
+
         # Note: model reference prevents garbage collection. Set cache.model = None if unneeded.
+
+    def _resolve_device(self, device: Optional[Union[str, torch.device]]) -> torch.device:
+        """Resolve an explicit device or warn and infer from current cache tensors."""
+        if device is not None:
+            return torch.device(device)
+        warnings.warn(
+            "Implicit ActivationCache device inference is deprecated. "
+            "Pass device= explicitly to this call to avoid inference.",
+            FutureWarning,
+            stacklevel=3,
+        )
+        return self.device
+
+    @property
+    def device(self) -> torch.device:
+        """Read the current first-tensor device, retaining placement for empty caches."""
+        first_tensor = next(iter(self.cache_dict.values()), None)
+        return first_tensor.device if first_tensor is not None else self._empty_cache_device
 
     def remove_batch_dim(self) -> ActivationCache:
         """Remove the Batch Dimension (if a single batch item).
@@ -180,9 +222,12 @@ class ActivationCache:
         a string that can be used to recreate the object, but here we just return a string that
         describes the object.
         """
-        return f"ActivationCache with keys {list(self.cache_dict.keys())}"
+        keys = list(islice(self.cache_dict, 10))
+        remaining = len(self.cache_dict) - len(keys)
+        suffix = f" ... ({remaining} more keys)" if remaining else ""
+        return f"ActivationCache with keys {keys}{suffix}"
 
-    def __getitem__(self, key) -> torch.Tensor:
+    def __getitem__(self, key: CacheKey) -> torch.Tensor:
         """Retrieve Cached Activations by Key or Shorthand.
 
         Enables direct access to cached activations via dictionary-style indexing using keys or
@@ -199,16 +244,17 @@ class ActivationCache:
         Returns:
             The cached activation tensor corresponding to the given key.
         """
-        if key in self.cache_dict:
-            return self.cache_dict[key]
-        elif type(key) == str:
+        if isinstance(key, str):
+            if key in self.cache_dict:
+                return self.cache_dict[key]
             return self.cache_dict[utils.get_act_name(key)]
-        else:
-            if len(key) > 1 and key[1] is not None:
-                if key[1] < 0:
-                    # Supports negative indexing on the layer dimension
-                    key = (key[0], self.model.cfg.n_layers + key[1], *key[2:])
-            return self.cache_dict[utils.get_act_name(*key)]
+
+        name = key[0]
+        layer = key[1] if len(key) > 1 else None
+        layer_type = key[2] if len(key) > 2 else None
+        if layer is not None and layer < 0:
+            layer = self.model.cfg.n_layers + layer
+        return self.cache_dict[utils.get_act_name(name, layer, layer_type)]
 
     def __len__(self) -> int:
         """Length of the ActivationCache.
@@ -232,10 +278,12 @@ class ActivationCache:
 
         """
         warn_if_mps(device)
-        self.cache_dict = {key: value.to(device) for key, value in self.cache_dict.items()}
+        target_device = torch.device(device)
+        self.cache_dict = {key: value.to(target_device) for key, value in self.cache_dict.items()}
+        self._empty_cache_device = target_device
         return self
 
-    def toggle_autodiff(self, mode: bool = False):
+    def toggle_autodiff(self, mode: bool = False) -> None:
         """Toggle Autodiff Globally.
 
         Applies `torch.set_grad_enabled(mode)` to the global state (not just TransformerLens).
@@ -263,7 +311,7 @@ class ActivationCache:
         logging.warning("Changed the global state, set autodiff to %s", mode)
         torch.set_grad_enabled(mode)
 
-    def keys(self):
+    def keys(self) -> KeysView[str]:
         """Keys of the ActivationCache.
 
         Examples:
@@ -276,23 +324,23 @@ class ActivationCache:
             ['hook_embed', 'hook_pos_embed', 'blocks.0.hook_resid_pre']
 
         Returns:
-            List of all keys.
+            A live dictionary view of all keys.
         """
         return self.cache_dict.keys()
 
-    def values(self):
+    def values(self) -> ValuesView[torch.Tensor]:
         """Values of the ActivationCache.
 
         Returns:
-            List of all values.
+            A live dictionary view of all values.
         """
         return self.cache_dict.values()
 
-    def items(self):
+    def items(self) -> ItemsView[str, torch.Tensor]:
         """Items of the ActivationCache.
 
         Returns:
-            List of all items ((key, value) tuples).
+            A live dictionary view of all (key, value) pairs.
         """
         return self.cache_dict.items()
 
@@ -340,7 +388,12 @@ class ActivationCache:
         new_cache_dict = {
             name: batch_slice.apply(param, dim=0) for name, param in self.cache_dict.items()
         }
-        return ActivationCache(new_cache_dict, self.model, has_batch_dim=still_has_batch_dim)
+        return ActivationCache(
+            new_cache_dict,
+            self.model,
+            has_batch_dim=still_has_batch_dim,
+            device=self.device,
+        )
 
     def accumulated_resid(
         self,
@@ -598,11 +651,9 @@ class ActivationCache:
                 incorrect_tokens_for_shape_check = torch.as_tensor(incorrect_tokens_for_shape_check)
 
             if tokens_for_shape_check.shape != incorrect_tokens_for_shape_check.shape:
-                raise ValueError(
-                    f"tokens and incorrect_tokens must have the same shape! \
+                raise ValueError(f"tokens and incorrect_tokens must have the same shape! \
                         (tokens.shape={tokens_for_shape_check.shape}, \
-                        incorrect_tokens.shape={incorrect_tokens_for_shape_check.shape})"
-                )
+                        incorrect_tokens.shape={incorrect_tokens_for_shape_check.shape})")
 
             # If incorrect_tokens was provided, take the logit difference
             logit_directions = logit_directions - self.model.tokens_to_residual_directions(
@@ -713,7 +764,7 @@ class ActivationCache:
 
     def compute_head_results(
         self,
-    ):
+    ) -> None:
         """Compute Head Results.
 
         Computes and caches the results for each attention head, ie the amount contributed to the
@@ -755,11 +806,13 @@ class ActivationCache:
 
     def stack_head_results(
         self,
-        layer: int = -1,
+        layer: Optional[int] = -1,
         return_labels: bool = False,
         incl_remainder: bool = False,
         pos_slice: Union[Slice, SliceInput] = None,
         apply_ln: bool = False,
+        *,
+        device: Optional[Union[str, torch.device]] = None,
     ) -> Union[
         Float[torch.Tensor, "num_components *batch_and_pos_dims d_model"],
         Tuple[Float[torch.Tensor, "num_components *batch_and_pos_dims d_model"], List[str]],
@@ -783,7 +836,11 @@ class ActivationCache:
                 A slice object to apply to the pos dimension. Defaults to None, do nothing.
             apply_ln:
                 Whether to apply LayerNorm to the stack.
+            device:
+                Output device. None warns and infers from the first cached tensor.
+                Computation still requires compatible cache and model devices.
         """
+        target_device = self._resolve_device(device)
         if not isinstance(pos_slice, Slice):
             pos_slice = Slice(pos_slice)
         pos_slice = cast(Slice, pos_slice)  # mypy can't seem to infer this
@@ -791,8 +848,9 @@ class ActivationCache:
             # Default to the residual stream immediately pre unembed
             layer = self.model.cfg.n_layers
 
-        # Idempotent; cleans up stale Bridge entries
-        self.compute_head_results()
+        # No head computation is needed for an empty stack.
+        if layer > 0:
+            self.compute_head_results()
 
         components: Any = []
         labels = []
@@ -819,19 +877,13 @@ class ActivationCache:
             )
             labels.append("remainder")
         else:
-            # If this is called with layer 0, we return an empty tensor of the right shape to be
-            # stacked correctly. This uses the shape of hook_embed, which is pretty janky since it
-            # assumes embed is in the cache. But it's hard to explicitly code the shape, since it
-            # depends on the pos slice, whether we have a batch dim, etc. And it's pretty messy!
-            components = torch.zeros(
-                0,
-                *pos_slice.apply(self["hook_embed"], dim=-2).shape,
-                device=self.model.cfg.device,
-            )
+            empty_src = pos_slice.apply(self["hook_embed"], dim=-2)
+            components = empty_src.new_zeros((0, *empty_src.shape))
 
         if apply_ln:
             components = self.apply_ln_to_stack(components, layer, pos_slice=pos_slice)
 
+        components = components.to(target_device)
         if return_labels:
             return components, labels
         else:
@@ -840,8 +892,10 @@ class ActivationCache:
     def stack_activation(
         self,
         activation_name: str,
-        layer: int = -1,
+        layer: Optional[int] = -1,
         sublayer_type: Optional[str] = None,
+        *,
+        device: Optional[Union[str, torch.device]] = None,
     ) -> Float[torch.Tensor, "layers_covered ..."]:
         """Stack Activations.
 
@@ -856,16 +910,17 @@ class ActivationCache:
             sublayer_type:
                 The sub layer type of the activation, passed to utils.get_act_name. Can normally be
                 inferred.
-            incl_remainder:
-                Whether to return a final term which is "the rest of the residual stream".
+            device:
+                Output device. None warns and infers from the first cached tensor.
         """
+        target_device = self._resolve_device(device)
         if layer is None or layer == -1:
             # Default to the residual stream immediately pre unembed
             layer = self.model.cfg.n_layers
 
         components = []
         for l in range(layer):
-            components.append(self[(activation_name, l, sublayer_type)])
+            components.append(self[(activation_name, l, sublayer_type)].to(target_device))
 
         return torch.stack(components, dim=0)
 
@@ -989,7 +1044,13 @@ class ActivationCache:
         if not components:
             empty_src = pos_slice.apply(self["hook_embed"], dim=-2)
             return torch.zeros(
-                0, *empty_src.shape[:-1], project_2d.shape[-1], device=self.model.cfg.device
+                0,
+                *empty_src.shape[:-1],
+                project_2d.shape[-1],
+                device=empty_src.device,
+                dtype=torch.promote_types(
+                    torch.promote_types(empty_src.dtype, scale.dtype), project_2d.dtype
+                ),
             )
         stacked = torch.cat(components, dim=-2)
         return einops.rearrange(
@@ -1108,10 +1169,15 @@ class ActivationCache:
                 components = torch.cat([remainder_full[None]], dim=0)
                 labels.append("remainder")
             else:
-                empty_shape_src = pos_slice.apply(self["hook_embed"], dim=-2)
+                empty_src = pos_slice.apply(self["hook_embed"], dim=-2)
+                empty_shape = tuple(empty_src.shape)
+                empty_dtype = empty_src.dtype
                 if project_2d is not None:
-                    empty_shape_src = empty_shape_src @ project_2d
-                components = torch.zeros(0, *empty_shape_src.shape, device=self.model.cfg.device)
+                    empty_shape = (*empty_shape[:-1], project_2d.shape[-1])
+                    empty_dtype = torch.promote_types(empty_dtype, project_2d.dtype)
+                components = torch.zeros(
+                    0, *empty_shape, device=empty_src.device, dtype=empty_dtype
+                )
 
             if apply_ln:
                 components = self.apply_ln_to_stack(components, layer, pos_slice=pos_slice)
@@ -1293,7 +1359,10 @@ class ActivationCache:
             return stack @ project_2d if project_2d is not None else stack
 
         head_stack, head_labels = self.stack_head_results(
-            layer + (1 if mlp_input else 0), pos_slice=pos_slice, return_labels=True
+            layer + (1 if mlp_input else 0),
+            pos_slice=pos_slice,
+            return_labels=True,
+            device=self.device,
         )
         if ln_folded:
             head_stack = _ln_then_project(head_stack)
